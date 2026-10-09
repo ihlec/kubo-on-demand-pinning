@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ipfs/kubo/config"
 	"github.com/libp2p/go-libp2p-kad-dht/amino"
+	kb "github.com/libp2p/go-libp2p-kbucket"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	routing "github.com/libp2p/go-libp2p/core/routing"
 	mh "github.com/multiformats/go-multihash"
@@ -71,8 +73,9 @@ type Checker struct {
 	unpinEnabled     bool
 	dryRun           bool
 
-	now         func() time.Time
-	graceJitter func() time.Duration
+	now           func() time.Time
+	graceJitter   func() time.Duration
+	distanceDelay func(c cid.Cid) time.Duration
 
 	urgentMu sync.Mutex
 	urgent   []cid.Cid
@@ -108,6 +111,9 @@ func NewChecker(
 		wakeCh: make(chan struct{}, 1),
 	}
 	c.graceJitter = c.defaultGraceJitter
+	c.distanceDelay = func(ci cid.Cid) time.Duration {
+		return cidDistanceDelay(c.selfID, ci, c.unpinGracePeriod)
+	}
 	return c
 }
 
@@ -316,10 +322,11 @@ func (c *Checker) handleWellReplicated(runCtx, lookupCtx context.Context, rec *R
 	if rec.LastAboveTarget.IsZero() {
 		now := c.now()
 		jitter := c.graceJitter()
+		dropDelay := c.distanceDelay(rec.Cid)
 		rec.LastAboveTarget = now
-		rec.UnpinAt = now.Add(c.unpinGracePeriod + jitter)
+		rec.UnpinAt = now.Add(c.unpinGracePeriod + dropDelay + jitter)
 		rec.LastResult = "grace"
-		log.Debugw("grace period started", "cid", rec.Cid, "providers", count, "max", c.replicationMax, "unpinAt", rec.UnpinAt, "jitter", jitter)
+		log.Debugw("grace period started", "cid", rec.Cid, "providers", count, "max", c.replicationMax, "unpinAt", rec.UnpinAt, "dropDelay", dropDelay, "jitter", jitter)
 		return nil
 	}
 
@@ -425,6 +432,25 @@ func (c *Checker) hasStorageBudget(ctx context.Context) bool {
 		return true
 	}
 	return used < limit
+}
+
+// cidDistanceDelay returns how long this node waits beyond UnpinGracePeriod
+// before unpinning c, scaled by the XOR distance between its peer ID and the
+// CID's DHT key. Peers far from the key drop first (≈0 extra delay), the
+// closest possible peer waits the full spread. The delay is deterministic and
+// identical on every node, so replicas drop in distance order instead of all
+// in the same window.
+func cidDistanceDelay(selfID peer.ID, c cid.Cid, spread time.Duration) time.Duration {
+	if spread <= 0 {
+		return 0
+	}
+	d := kb.Xor(kb.ConvertPeerID(selfID), kb.ConvertKey(string(c.Hash())))
+	keyspace := new(big.Int).Lsh(big.NewInt(1), uint(len(d)*8))
+	q, _ := new(big.Float).Quo(
+		new(big.Float).SetInt(new(big.Int).SetBytes(d)),
+		new(big.Float).SetInt(keyspace),
+	).Float64()
+	return time.Duration((1 - q) * float64(spread))
 }
 
 func PinOwnershipFromPinner(ctx context.Context, p pin.Pinner, c cid.Cid, onDemandName string) (PinOwnership, error) {

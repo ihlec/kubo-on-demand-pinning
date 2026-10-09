@@ -131,6 +131,7 @@ func newTestChecker(t *testing.T) (*Checker, *Store, *mockRouting, *mockPins, *f
 	checker.unpinGracePeriod = 200 * time.Millisecond
 	checker.now = clock.Now
 	checker.graceJitter = func() time.Duration { return 0 }
+	checker.distanceDelay = func(c cid.Cid) time.Duration { return 0 }
 
 	return checker, store, r, p, clock, prov
 }
@@ -464,6 +465,7 @@ func TestCheckerDryRunDoesNotPinOrUnpin(t *testing.T) {
 	checker.unpinGracePeriod = 200 * time.Millisecond
 	checker.now = clock.Now
 	checker.graceJitter = func() time.Duration { return 0 }
+	checker.distanceDelay = func(c cid.Cid) time.Duration { return 0 }
 
 	c := testCID(t, "dry-run")
 	require.NoError(t, store.Add(ctx, c))
@@ -490,6 +492,43 @@ func TestCheckerDryRunDoesNotPinOrUnpin(t *testing.T) {
 	assert.True(t, p.isPinned(c), "dry-run must not unpin")
 	rec = mustGet(t, store, c)
 	assert.Equal(t, "would-unpin", rec.LastResult)
+}
+
+// The distance-based drop delay lands inside [0, spread].
+func TestCidDistanceDelayBounds(t *testing.T) {
+	c := testCID(t, "distance")
+	for _, id := range providers(20) {
+		d := cidDistanceDelay(id, c, 10*time.Second)
+		assert.GreaterOrEqual(t, d, time.Duration(0))
+		assert.LessOrEqual(t, d, 10*time.Second)
+	}
+	assert.Zero(t, cidDistanceDelay(peer.ID("self"), c, 0))
+}
+
+// The drop delay derived from PeerID/CID distance extends UnpinAt past the
+// grace period; identical delay means identical drop time on every node.
+func TestCheckerDistanceDelayOrdersDrop(t *testing.T) {
+	ctx := context.Background()
+	checker, store, r, p, clock, _ := newTestChecker(t)
+	checker.distanceDelay = func(c cid.Cid) time.Duration { return 300 * time.Millisecond }
+	c := testCID(t, "far-then-near")
+
+	require.NoError(t, store.Add(ctx, c))
+	require.NoError(t, p.Pin(ctx, c, OnDemandPinName))
+	r.setProviders(c, providers(8)...)
+
+	checker.checkAll(ctx)
+	rec := mustGet(t, store, c)
+	// grace 200ms + distance delay 300ms
+	assert.Equal(t, clock.Now().Add(500*time.Millisecond), rec.UnpinAt)
+
+	clock.Advance(250 * time.Millisecond) // past grace, inside distance delay
+	checker.checkAll(ctx)
+	assert.True(t, p.isPinned(c), "distance delay must hold the pin")
+
+	clock.Advance(300 * time.Millisecond) // past grace + distance delay
+	checker.checkAll(ctx)
+	assert.False(t, p.isPinned(c))
 }
 
 // UnpinEnabled=false still pins under-replicated CIDs but never unpins,

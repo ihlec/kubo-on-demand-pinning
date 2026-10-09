@@ -618,9 +618,14 @@ Experimental, disabled by default.
 
 On-demand pinning is a "replication keeper": it lets a node pin registered
 content when DHT provider counts fall below a minimum, and unpin after they
-stay above a maximum for a grace period (plus a short random delay). Values
-between min and max are left alone. Provider counts come from `FindProviders`,
-not from the peer routing table.
+stay above a maximum for a grace period. Values between min and max are left
+alone. Provider counts come from `FindProviders`, not from the peer routing
+table.
+
+Replicas do not all drop at once: after the grace period each node adds a
+delay scaled by the XOR distance between its peer ID and the CID's DHT key,
+so the farthest replicas release first and the closest hold longest (plus a
+short random delay).
 
 It is a decentralized and uncoordinated sibling of
 [ipfs-cluster replication factors](https://ipfscluster.io/documentation/guides/pinning/#replication-factors):
