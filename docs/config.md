@@ -2287,9 +2287,11 @@ Type: `optionalDuration`
 
 ### `OnDemandPinning.UnpinGracePeriod`
 
-How long the provider count must stay above max before the local pin is removed.
-The checker also adds a random delay of up to `2 * CheckInterval` when grace
-starts, so nodes that entered grace together do not all unpin at once.
+How long the provider count must stay above max before the local pin is
+removed. After the grace period the checker adds a deterministic delay of up
+to `UnpinGracePeriod` scaled by the XOR distance between the peer ID and the
+CID's DHT key, so replicas drop in distance order (farthest first) rather than
+all at once, plus a random delay of up to `2 * CheckInterval`.
 
 Should be longer than DHT provider-record validity (48h). A shorter value can
 unpin while stale records still make the count look healthy.
