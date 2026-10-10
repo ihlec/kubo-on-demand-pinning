@@ -567,6 +567,84 @@ func TestEnqueueIsReliable(t *testing.T) {
 	<-done
 }
 
+// byDistance orders ids from closest to farthest from c.
+func byDistance(ids []peer.ID, c cid.Cid) []peer.ID {
+	out := make([]peer.ID, len(ids))
+	for _, id := range ids {
+		out[UnpinRank(id, ids, c)] = id
+	}
+	return out
+}
+
+func others(ids []peer.ID, self peer.ID) []peer.ID {
+	var out []peer.ID
+	for _, id := range ids {
+		if id != self {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func TestUnpinRank(t *testing.T) {
+	c := testCID(t, "rank")
+	ordered := byDistance(providers(10), c)
+	for want, id := range ordered {
+		assert.Equal(t, want, UnpinRank(id, ordered, c))
+	}
+}
+
+// newRankedChecker returns a checker holding an on-demand pin on c, with ten
+// holders (self included) and max 7, so three holders are above max.
+func newRankedChecker(t *testing.T, c cid.Cid, self peer.ID, all []peer.ID) (*Checker, *mockPins, *fakeClock) {
+	t.Helper()
+	ctx := context.Background()
+	checker, store, r, p, clock, _ := newTestChecker(t)
+	checker.selfID = self
+	checker.rankedUnpin = true
+	checker.recordLifetime = time.Second
+	checker.checkInterval = 100 * time.Millisecond
+	require.NoError(t, store.Add(ctx, c))
+	require.NoError(t, p.Pin(ctx, c, OnDemandPinName))
+	r.setProviders(c, others(all, self)...)
+	return checker, p, clock
+}
+
+func TestRankedUnpinKeeperKeepsPin(t *testing.T) {
+	ctx := context.Background()
+	c := testCID(t, "ranked-keeper")
+	ordered := byDistance(providers(10), c)
+	checker, p, clock := newRankedChecker(t, c, ordered[0], ordered)
+
+	checker.checkAll(ctx)
+	clock.Advance(time.Hour)
+	checker.checkAll(ctx)
+	assert.True(t, p.isPinned(c), "the closest holder is among the max closest and keeps its pin")
+}
+
+func TestRankedUnpinFarthestFirst(t *testing.T) {
+	ctx := context.Background()
+	c := testCID(t, "ranked-order")
+	ordered := byDistance(providers(10), c)
+	step := time.Second + 3*100*time.Millisecond
+
+	farthest, pf, clockF := newRankedChecker(t, c, ordered[9], ordered)
+	second, ps, clockS := newRankedChecker(t, c, ordered[8], ordered)
+
+	farthest.checkAll(ctx)
+	second.checkAll(ctx)
+	clockF.Advance(300 * time.Millisecond) // past the 200ms grace period
+	clockS.Advance(300 * time.Millisecond)
+	farthest.checkAll(ctx)
+	second.checkAll(ctx)
+	assert.False(t, pf.isPinned(c), "farthest holder unpins right after the grace period")
+	assert.True(t, ps.isPinned(c), "second farthest waits one step")
+
+	clockS.Advance(step)
+	second.checkAll(ctx)
+	assert.False(t, ps.isPinned(c), "second farthest unpins one step later")
+}
+
 func mustGet(t *testing.T, store *Store, c cid.Cid) *Record {
 	t.Helper()
 	rec, err := store.Get(context.Background(), c)

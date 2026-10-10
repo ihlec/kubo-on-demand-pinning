@@ -1,7 +1,9 @@
 package ondemandpin
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -12,7 +14,6 @@ import (
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ipfs/kubo/config"
-	"github.com/libp2p/go-libp2p-kad-dht/amino"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	routing "github.com/libp2p/go-libp2p/core/routing"
 	mh "github.com/multiformats/go-multihash"
@@ -70,6 +71,8 @@ type Checker struct {
 	maxBackoff       time.Duration
 	dryRun           bool
 	probe            ProviderProbe
+	rankedUnpin      bool
+	recordLifetime   time.Duration
 
 	now         func() time.Time
 	graceJitter func() time.Duration
@@ -102,6 +105,8 @@ func NewChecker(
 		unpinGracePeriod: cfg.UnpinGracePeriod.WithDefault(config.DefaultOnDemandPinUnpinGracePeriod),
 		maxBackoff:       config.DefaultOnDemandPinCheckBackoffMax,
 		dryRun:           cfg.DryRun.WithDefault(false),
+		rankedUnpin:      cfg.RankedUnpin.WithDefault(false),
+		recordLifetime:   config.ProvideValidity(),
 
 		now:    time.Now,
 		wakeCh: make(chan struct{}, 1),
@@ -139,9 +144,9 @@ func (c *Checker) Run(ctx context.Context) {
 	log.Info("on-demand pin checker started")
 	defer log.Info("on-demand pin checker stopped")
 
-	if c.unpinGracePeriod < amino.DefaultProvideValidity {
+	if c.unpinGracePeriod < c.recordLifetime {
 		log.Warnw("UnpinGracePeriod is shorter than the DHT provider record validity; provider counts may include dead peers and this node may unpin the last live copy",
-			"gracePeriod", c.unpinGracePeriod, "recordValidity", amino.DefaultProvideValidity)
+			"gracePeriod", c.unpinGracePeriod, "recordValidity", c.recordLifetime)
 	}
 
 	ticker := time.NewTicker(c.checkInterval)
@@ -243,6 +248,11 @@ func (c *Checker) checkRecord(ctx context.Context, rec *Record, immediate bool) 
 			c.recordFailure(ctx, rec, err)
 			return
 		}
+	case count > c.replicationMax && c.rankedUnpin:
+		if err := c.handleRankedUnpin(ctx, lookupCtx, rec, own); err != nil {
+			c.recordFailure(ctx, rec, err)
+			return
+		}
 	case count > c.replicationMax:
 		if err := c.handleWellReplicated(ctx, lookupCtx, rec, count, own); err != nil {
 			c.recordFailure(ctx, rec, err)
@@ -322,7 +332,62 @@ func (c *Checker) handleWellReplicated(runCtx, lookupCtx context.Context, rec *R
 		rec.LastResult = "grace"
 		return nil
 	}
+	return c.unpinNow(runCtx, lookupCtx, rec, count)
+}
 
+// handleRankedUnpin is handleWellReplicated with a deterministic order.
+// Holders rank themselves among all providers by XOR distance to the CID. The
+// replicationMax closest keep their pins. The others unpin farthest first,
+// spaced one step apart, where a step outlasts a provider record, so each
+// unpin decision sees a count without the records of earlier unpins.
+func (c *Checker) handleRankedUnpin(runCtx, lookupCtx context.Context, rec *Record, own PinOwnership) error {
+	if !own.HasOnDemandPin {
+		rec.LastResult = "above-max"
+		return nil
+	}
+
+	providers, ok := FindProviders(lookupCtx, c.routing, c.selfID, rec.Cid, rankedLookupLimit, c.probe)
+	if !ok {
+		return fmt.Errorf("provider lookup for ranked unpin failed")
+	}
+	count := len(providers)
+	clearGrace := func(result string) error {
+		rec.LastAboveTarget = time.Time{}
+		rec.UnpinAt = time.Time{}
+		rec.LastResult = result
+		return nil
+	}
+	if count <= c.replicationMax {
+		return clearGrace("deadband")
+	}
+	rank := UnpinRank(c.selfID, providers, rec.Cid)
+	if rank < c.replicationMax {
+		return clearGrace("keeper")
+	}
+
+	// Position 0 is the farthest provider, which unpins first.
+	position := count - rank
+	step := c.recordLifetime + 3*c.checkInterval
+	now := c.now()
+	if rec.LastAboveTarget.IsZero() {
+		jitter := c.graceJitter()
+		rec.LastAboveTarget = now
+		rec.UnpinAt = now.Add(c.unpinGracePeriod + jitter + time.Duration(position)*step)
+		rec.LastResult = "grace"
+		log.Debugw("ranked grace period started", "cid", rec.Cid, "providers", count, "rank", rank, "position", position, "unpinAt", rec.UnpinAt)
+		return nil
+	}
+	if due := rec.LastAboveTarget.Add(c.unpinGracePeriod + time.Duration(position)*step); rec.UnpinAt.Before(due) {
+		rec.UnpinAt = due
+	}
+	if now.Before(rec.UnpinAt) {
+		rec.LastResult = "grace"
+		return nil
+	}
+	return c.unpinNow(runCtx, lookupCtx, rec, count)
+}
+
+func (c *Checker) unpinNow(runCtx, lookupCtx context.Context, rec *Record, count int) error {
 	ownNow, err := c.pins.PinOwnership(lookupCtx, rec.Cid, OnDemandPinName)
 	if err != nil {
 		return fmt.Errorf("check pin ownership before unpin: %w", err)
@@ -521,4 +586,59 @@ func CountProvidersLive(ctx context.Context, cr routing.ContentRouting, selfID p
 		return count, false
 	}
 	return count, true
+}
+
+// rankedLookupLimit caps the providers collected for ranked unpin. Ranking
+// needs every holder, not just enough to cross max, so the lookup does not
+// stop early.
+const rankedLookupLimit = 64
+
+// FindProviders returns the distinct providers other than self, excluding
+// those a non-nil probe reports unreachable. ok is false if the lookup was
+// cancelled before returning anything.
+func FindProviders(ctx context.Context, cr routing.ContentRouting, selfID peer.ID, c cid.Cid, limit int, probe ProviderProbe) (providers []peer.ID, ok bool) {
+	seen := make(map[peer.ID]struct{})
+	for pi := range cr.FindProvidersAsync(ctx, c, limit) {
+		if pi.ID == selfID {
+			continue
+		}
+		if _, dup := seen[pi.ID]; dup {
+			continue
+		}
+		seen[pi.ID] = struct{}{}
+		if probe != nil && !probe(ctx, pi) {
+			continue
+		}
+		providers = append(providers, pi.ID)
+	}
+	if ctx.Err() != nil && len(providers) == 0 {
+		return nil, false
+	}
+	return providers, true
+}
+
+// UnpinRank returns how many providers are closer to c than self, by XOR
+// distance in the Kademlia keyspace (SHA-256 of peer ID and of multihash).
+// Every holder computes the same order from the same provider set.
+func UnpinRank(self peer.ID, providers []peer.ID, c cid.Cid) int {
+	key := sha256.Sum256(c.Hash())
+	dist := func(p peer.ID) [sha256.Size]byte {
+		h := sha256.Sum256([]byte(p))
+		for i := range h {
+			h[i] ^= key[i]
+		}
+		return h
+	}
+	own := dist(self)
+	rank := 0
+	for _, p := range providers {
+		if p == self {
+			continue
+		}
+		d := dist(p)
+		if bytes.Compare(d[:], own[:]) < 0 {
+			rank++
+		}
+	}
+	return rank
 }

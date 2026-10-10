@@ -43,6 +43,14 @@ type OnDemandPinning struct {
 
 	// Dial timeout per provider when ProbeProviders is enabled.
 	ProbeTimeout OptionalDuration `json:",omitempty"`
+
+	// When true, holders above ReplicationTargetMax unpin in a fixed order
+	// instead of all at once. Providers are ranked by XOR distance to the CID;
+	// the ReplicationTargetMax closest keep their pins, and the others unpin
+	// farthest first, one per provider-record lifetime, re-checking the count
+	// before each unpin. Without it, holders that unpinned keep counting until
+	// their records expire, and concurrent unpins can remove every copy.
+	RankedUnpin Flag `json:",omitempty"`
 }
 
 const DefaultOnDemandPinProbeTimeout = 5 * time.Second
