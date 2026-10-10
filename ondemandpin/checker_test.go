@@ -286,7 +286,7 @@ func TestCountProvidersUnknownOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	count, ok := CountProviders(ctx, blockingRouting{}, peer.ID("self"), testCID(t, "unknown"), 5, 7, false)
+	count, ok := CountProviders(ctx, blockingRouting{}, peer.ID("self"), testCID(t, "unknown"), 5, 7, false, nil)
 	assert.False(t, ok)
 	assert.Equal(t, 0, count)
 }
@@ -327,7 +327,7 @@ func TestCountProvidersOkWhenEnoughFoundDespiteCancel(t *testing.T) {
 	var ok bool
 	go func() {
 		defer close(done)
-		count, ok = CountProviders(ctx, r, peer.ID("self"), testCID(t, "enough"), 5, 7, false)
+		count, ok = CountProviders(ctx, r, peer.ID("self"), testCID(t, "enough"), 5, 7, false, nil)
 	}()
 
 	time.Sleep(20 * time.Millisecond) // let providers flush
@@ -343,16 +343,59 @@ func TestCountProvidersEarlyExit(t *testing.T) {
 	defer cancel()
 
 	rMin := &emitThenBlockRouting{providers: providers(20)}
-	count, ok := CountProviders(ctx, rMin, peer.ID("self"), testCID(t, "early-min"), 5, 7, false)
+	count, ok := CountProviders(ctx, rMin, peer.ID("self"), testCID(t, "early-min"), 5, 7, false, nil)
 	require.True(t, ok)
 	assert.Equal(t, 5, count)
 	assert.Less(t, int(rMin.emitted.Load()), 20)
 
 	rMax := &emitThenBlockRouting{providers: providers(20)}
-	count, ok = CountProviders(ctx, rMax, peer.ID("self"), testCID(t, "early-max"), 5, 7, true)
+	count, ok = CountProviders(ctx, rMax, peer.ID("self"), testCID(t, "early-max"), 5, 7, true, nil)
 	require.True(t, ok)
 	assert.Equal(t, 8, count)
 	assert.Less(t, int(rMax.emitted.Load()), 20)
+}
+
+func TestCountProvidersProbeExcludesUnreachable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	// Nine stale records ahead of three live ones: without widening the
+	// lookup, max+2 = 9 slots would hold only stale providers.
+	stale := providers(9)
+	live := []peer.ID{"live1", "live2", "live3"}
+	r := &emitThenBlockRouting{providers: append(append([]peer.ID{}, stale...), live...)}
+	reachable := map[peer.ID]bool{"live1": true, "live2": true, "live3": true}
+	probe := func(_ context.Context, pi peer.AddrInfo) bool { return reachable[pi.ID] }
+
+	count, ok := CountProviders(ctx, r, peer.ID("self"), testCID(t, "probe"), 3, 7, false, probe)
+	require.True(t, ok)
+	assert.Equal(t, 3, count)
+
+	rNoProbe := &emitThenBlockRouting{providers: append(append([]peer.ID{}, stale...), live...)}
+	count, ok = CountProviders(ctx, rNoProbe, peer.ID("self"), testCID(t, "no-probe"), 3, 7, false, nil)
+	require.True(t, ok)
+	assert.Equal(t, 3, count, "without a probe, stale records count as providers")
+}
+
+// Provider records of killed peers keep a CID above min until they expire;
+// with a probe the checker sees the real count and re-pins.
+func TestCheckerRepinsWhenProvidersUnreachable(t *testing.T) {
+	ctx := context.Background()
+	c := testCID(t, "stale-records")
+	dead := []peer.ID{"dead1", "dead2", "dead3", "dead4", "dead5"}
+
+	checker, store, r, p, _, _ := newTestChecker(t)
+	require.NoError(t, store.Add(ctx, c))
+	r.setProviders(c, append(append([]peer.ID{}, dead...), "live1")...)
+	checker.checkAll(ctx)
+	assert.False(t, p.isPinned(c), "without a probe, stale records hide under-replication")
+
+	checker, store, r, p, _, _ = newTestChecker(t)
+	require.NoError(t, store.Add(ctx, c))
+	r.setProviders(c, append(append([]peer.ID{}, dead...), "live1")...)
+	checker.SetProviderProbe(func(_ context.Context, pi peer.AddrInfo) bool { return pi.ID == "live1" })
+	checker.checkAll(ctx)
+	assert.True(t, p.isPinned(c), "probe exposes 1 live provider below min 5")
 }
 
 func TestCheckerSkipsWhenProviderCountUnknown(t *testing.T) {

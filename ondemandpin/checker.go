@@ -69,6 +69,7 @@ type Checker struct {
 	unpinGracePeriod time.Duration
 	maxBackoff       time.Duration
 	dryRun           bool
+	probe            ProviderProbe
 
 	now         func() time.Time
 	graceJitter func() time.Duration
@@ -107,6 +108,11 @@ func NewChecker(
 	}
 	c.graceJitter = c.defaultGraceJitter
 	return c
+}
+
+// SetProviderProbe makes the checker count only providers the probe reports reachable.
+func (c *Checker) SetProviderProbe(p ProviderProbe) {
+	c.probe = p
 }
 
 func (c *Checker) defaultGraceJitter() time.Duration {
@@ -223,7 +229,7 @@ func (c *Checker) checkRecord(ctx context.Context, rec *Record, immediate bool) 
 	}
 
 	needOverMax := own.HasOnDemandPin || !rec.LastAboveTarget.IsZero() || !rec.UnpinAt.IsZero()
-	count, ok := CountProviders(lookupCtx, c.routing, c.selfID, rec.Cid, c.replicationMin, c.replicationMax, needOverMax)
+	count, ok := CountProviders(lookupCtx, c.routing, c.selfID, rec.Cid, c.replicationMin, c.replicationMax, needOverMax, c.probe)
 	if !ok {
 		rec.LastResult = "lookup-unknown"
 		c.recordFailure(ctx, rec, fmt.Errorf("provider count unknown"))
@@ -443,22 +449,46 @@ func PinHasName(ctx context.Context, p pin.Pinner, c cid.Cid, name string) (bool
 	return own.HasOnDemandPin, nil
 }
 
+// ProviderProbe reports whether a provider is reachable now.
+type ProviderProbe func(ctx context.Context, pi peer.AddrInfo) bool
+
+// probeLookupFactor widens the provider lookup when probing, so that stale
+// records of offline peers do not use up all result slots.
+const probeLookupFactor = 4
+
 // CountProviders counts providers excluding self. Asks for max+2 results so
 // self can take a slot and we can still see max+1 others.
 // When needOverMax is false, cancels once count >= min; otherwise only once count > max.
+// A non-nil probe excludes providers it reports unreachable.
 // ok is false if the lookup was cancelled before reaching min providers.
-func CountProviders(ctx context.Context, cr routing.ContentRouting, selfID peer.ID, c cid.Cid, min, max int, needOverMax bool) (count int, ok bool) {
+func CountProviders(ctx context.Context, cr routing.ContentRouting, selfID peer.ID, c cid.Cid, min, max int, needOverMax bool, probe ProviderProbe) (count int, ok bool) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	ch := cr.FindProvidersAsync(ctx, c, max+2)
+	limit := max + 2
+	if probe != nil {
+		limit *= probeLookupFactor
+	}
+	ch := cr.FindProvidersAsync(ctx, c, limit)
 	seen := make(map[peer.ID]struct{})
+	unreachable := make(map[peer.ID]struct{})
 	done := false
 	for pi := range ch {
 		if done {
 			continue
 		}
 		if pi.ID == selfID {
+			continue
+		}
+		if _, dup := seen[pi.ID]; dup {
+			continue
+		}
+		if _, dup := unreachable[pi.ID]; dup {
+			continue
+		}
+		if probe != nil && !probe(ctx, pi) {
+			unreachable[pi.ID] = struct{}{}
+			log.Debugw("provider unreachable, not counted", "cid", c, "provider", pi.ID)
 			continue
 		}
 		seen[pi.ID] = struct{}{}

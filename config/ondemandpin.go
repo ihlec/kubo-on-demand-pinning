@@ -35,7 +35,17 @@ type OnDemandPinning struct {
 
 	// When true, the checker logs pin/unpin decisions but does not change the pinset.
 	DryRun Flag `json:",omitempty"`
+
+	// When true, a provider counts toward replication only if this node is
+	// connected to it or can dial it within ProbeTimeout. Provider records of
+	// peers that went offline otherwise keep counting until they expire.
+	ProbeProviders Flag `json:",omitempty"`
+
+	// Dial timeout per provider when ProbeProviders is enabled.
+	ProbeTimeout OptionalDuration `json:",omitempty"`
 }
+
+const DefaultOnDemandPinProbeTimeout = 5 * time.Second
 
 // ValidateOnDemandPinningConfig rejects invalid min/max and non-positive durations.
 func ValidateOnDemandPinningConfig(cfg *OnDemandPinning) error {
@@ -52,6 +62,9 @@ func ValidateOnDemandPinningConfig(cfg *OnDemandPinning) error {
 	}
 	if grace := cfg.UnpinGracePeriod.WithDefault(DefaultOnDemandPinUnpinGracePeriod); grace <= 0 {
 		return fmt.Errorf("OnDemandPinning.UnpinGracePeriod must be positive, got %v", grace)
+	}
+	if timeout := cfg.ProbeTimeout.WithDefault(DefaultOnDemandPinProbeTimeout); timeout <= 0 {
+		return fmt.Errorf("OnDemandPinning.ProbeTimeout must be positive, got %v", timeout)
 	}
 	return nil
 }

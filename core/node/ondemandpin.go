@@ -10,6 +10,8 @@ import (
 	pin "github.com/ipfs/boxo/pinning/pinner"
 	"github.com/ipfs/go-cid"
 	format "github.com/ipfs/go-ipld-format"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	routing "github.com/libp2p/go-libp2p/core/routing"
 	"go.uber.org/fx"
@@ -121,6 +123,18 @@ func (s *kuboStorageChecker) StorageUsage(ctx context.Context) (uint64, uint64, 
 	return used, max * uint64(wm) / 100, nil
 }
 
+// dialProbe treats a provider as reachable if it is connected or answers a dial within timeout.
+func dialProbe(h host.Host, timeout time.Duration) ondemandpin.ProviderProbe {
+	return func(ctx context.Context, pi peer.AddrInfo) bool {
+		if h.Network().Connectedness(pi.ID) == network.Connected {
+			return true
+		}
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		return h.Connect(ctx, pi) == nil
+	}
+}
+
 func OnDemandPinStore(r repo.Repo) *ondemandpin.Store {
 	return ondemandpin.NewStore(r.Datastore())
 }
@@ -136,6 +150,7 @@ func OnDemandPinChecker(cfg config.OnDemandPinning) func(
 	dag format.DAGService,
 	bs blockstore.GCBlockstore,
 	id peer.ID,
+	h host.Host,
 ) *ondemandpin.Checker {
 	return func(
 		mctx helpers.MetricsCtx,
@@ -148,10 +163,14 @@ func OnDemandPinChecker(cfg config.OnDemandPinning) func(
 		dag format.DAGService,
 		bs blockstore.GCBlockstore,
 		id peer.ID,
+		h host.Host,
 	) *ondemandpin.Checker {
 		pins := &kuboPinService{pinner: pinner, dag: dag, bs: bs}
 		storage := &kuboStorageChecker{repo: r}
 		checker := ondemandpin.NewChecker(store, pins, storage, cr, prov, id, cfg)
+		if cfg.ProbeProviders.WithDefault(false) {
+			checker.SetProviderProbe(dialProbe(h, cfg.ProbeTimeout.WithDefault(config.DefaultOnDemandPinProbeTimeout)))
+		}
 		ctx := helpers.LifecycleCtx(mctx, lc)
 
 		lc.Append(fx.Hook{
