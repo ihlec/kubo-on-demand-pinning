@@ -13,6 +13,7 @@ import (
 	irouting "github.com/ipfs/kubo/routing"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	dual "github.com/libp2p/go-libp2p-kad-dht/dual"
+	"github.com/libp2p/go-libp2p-kad-dht/records"
 	record "github.com/libp2p/go-libp2p-record"
 	routinghelpers "github.com/libp2p/go-libp2p-routing-helpers"
 	host "github.com/libp2p/go-libp2p/core/host"
@@ -255,6 +256,9 @@ func constructDHTRouting(mode dht.ModeOpt) RoutingOption {
 		}
 		if args.OptimisticProvideJobsPoolSize != 0 {
 			dhtOpts = append(dhtOpts, dht.OptimisticProvideJobsPoolSize(args.OptimisticProvideJobsPoolSize))
+		}
+		if os.Getenv(config.TestProvideValidityEnv) != "" {
+			dhtOpts = append(dhtOpts, dht.ProviderManagerOpts(records.ProvideValidity(config.ProvideValidity())))
 		}
 		wanOptions := []dht.Option{
 			dht.BootstrapPeers(args.BootstrapPeers...),

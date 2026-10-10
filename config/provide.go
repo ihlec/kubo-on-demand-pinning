@@ -2,11 +2,27 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/libp2p/go-libp2p-kad-dht/amino"
 )
+
+// TestProvideValidityEnv shortens how long DHT servers keep provider records.
+// It exists for testbeds that scale protocol time; without it, Kubo uses the
+// Amino default.
+const TestProvideValidityEnv = "TEST_DHT_PROVIDE_VALIDITY"
+
+// ProvideValidity returns how long a provider record stays valid on DHT servers.
+func ProvideValidity() time.Duration {
+	if v := os.Getenv(TestProvideValidityEnv); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return amino.DefaultProvideValidity
+}
 
 const (
 	DefaultProvideEnabled  = true
@@ -211,8 +227,8 @@ func ValidateProvideConfig(cfg *Provide) error {
 	// Validate Provide.DHT.Interval
 	if !cfg.DHT.Interval.IsDefault() {
 		interval := cfg.DHT.Interval.WithDefault(DefaultProvideDHTInterval)
-		if interval > amino.DefaultProvideValidity {
-			return fmt.Errorf("Provide.DHT.Interval (%v) must be less than or equal to DHT provider record validity (%v)", interval, amino.DefaultProvideValidity)
+		if validity := ProvideValidity(); interval > validity {
+			return fmt.Errorf("Provide.DHT.Interval (%v) must be less than or equal to DHT provider record validity (%v)", interval, validity)
 		}
 		if interval < 0 {
 			return fmt.Errorf("Provide.DHT.Interval must be non-negative, got %v", interval)
